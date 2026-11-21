@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ThermoAssistant</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#6a7482; --accent:#e4572e; --line:#e2e6ec; --me:#e4572e; --bot:#eef1f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14181d; --card:#1d232b; --text:#e8ecf1; --muted:#9aa5b3; --line:#2c3541; --bot:#262e38; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 8px 0 12px; }
+  .tabs { display:flex; gap:8px; margin-bottom:12px; }
+  .tabs button { flex:1; padding:10px; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:8px; cursor:pointer; font:inherit; }
+  .tabs button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:12px; }
+  #wx { color:var(--muted); font-size:.9rem; margin-bottom:12px; }
+  #log { height: 55vh; overflow-y:auto; display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:85%; padding:8px 12px; border-radius:12px; white-space:pre-wrap; }
+  .msg.me { align-self:flex-end; background:var(--me); color:#fff; }
+  .msg.bot { align-self:flex-start; background:var(--bot); }
+  form.row { display:flex; gap:8px; margin-top:10px; }
+  input { padding:9px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--text); font:inherit; min-width:0; }
+  input.grow { flex:1; }
+  button.go { padding:9px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; font:inherit; }
+  button.go:disabled { opacity:.5; }
+  button.link { background:none; border:0; color:var(--muted); cursor:pointer; font:inherit; text-decoration:underline; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap:10px; }
+  .stat b { display:block; font-size:1.4rem; }
+  .stat span { color:var(--muted); font-size:.85rem; }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  th, td { text-align:left; padding:6px 4px; border-bottom:1px solid var(--line); }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chips button { border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:16px; padding:4px 10px; cursor:pointer; font:inherit; font-size:.85rem; }
+  .hidden { display:none; }
+  .err { color:#c0392b; }
+  .note { color:var(--muted); font-size:.8rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ThermoAssistant</h1>
+  <div id="wx">Loading weather…</div>
+  <div class="tabs">
+    <button id="t-chat" class="active">Chat</button>
+    <button id="t-coach">Energy coach</button>
+  </div>
+
+  <section id="chat" class="card">
+    <div id="log" aria-live="polite"></div>
+    <div class="chips" id="chips"></div>
+    <form class="row" id="chatForm">
+      <input class="grow" id="msg" placeholder="Ask about your thermostat…" autocomplete="off" maxlength="2000" required>
+      <button class="go" id="send">Send</button>
+    </form>
+    <button class="link" id="reset" type="button">New conversation</button>
+  </section>
+
+  <section id="coach" class="hidden">
+    <div class="card">
+      <b>Log a day</b>
+      <form class="row" id="usageForm" style="flex-wrap:wrap">
+        <input type="date" id="u-date" required>
+        <input type="number" id="u-cost" step="0.01" min="0" placeholder="Cost $" required style="width:100px">
+        <input type="number" id="u-set" step="0.5" min="40" max="100" placeholder="Setpoint °F" style="width:120px">
+        <button class="go">Save</button>
+      </form>
+      <div class="note">Enter that day's heating/cooling cost (or your total daily electric/gas cost) and your typical thermostat setting.</div>
+      <div id="u-err" class="err"></div>
+    </div>
+    <div class="card" id="stats">Loading…</div>
+    <div class="card">
+      <button class="go" id="adviceBtn">Get AI coaching</button>
+      <div id="advice" style="white-space:pre-wrap; margin-top:10px"></div>
+    </div>
+    <div class="card"><b>Logged days</b><table id="tbl"></table></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const sid = (() => { try { let s = localStorage.getItem("sid"); if (!s) { s = crypto.randomUUID(); localStorage.setItem("sid", s); } return s; } catch { return "anon-" + Math.random().toString(36).slice(2); } })();
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || r.statusText);
+  return j;
+}
+const post = (path, body) => api(path, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
+
+// Tabs
+function show(tab) {
+  $("chat").classList.toggle("hidden", tab !== "chat");
+  $("coach").classList.toggle("hidden", tab !== "coach");
+  $("t-chat").classList.toggle("active", tab === "chat");
+  $("t-coach").classList.toggle("active", tab === "coach");
+  if (tab === "coach") loadCoach();
+}
+$("t-chat").onclick = () => show("chat");
+$("t-coach").onclick = () => show("coach");
+
+// Weather strip
+api("/api/weather").then(w => {
+  $("wx").textContent = `Ballwin now: ${Math.round(w.now_f)}°F (feels ${Math.round(w.feels_like_f)}°F) · High ${Math.round(w.today_high_f)}° / Low ${Math.round(w.today_low_f)}°`;
+}).catch(() => { $("wx").textContent = "Weather unavailable right now."; });
+
+// Chat
+function add(role, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + role;
+  d.textContent = text;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+  return d;
+}
+add("bot", "Hi! Ask me what to set your thermostat to, or tell me your plans (guests, away, sleeping).");
+["What should I set it to right now?", "I'll be away until Thursday", "I like it at 68 overnight"].forEach(t => {
+  const b = document.createElement("button"); b.textContent = t; b.type = "button";
+  b.onclick = () => { $("msg").value = t; $("chatForm").requestSubmit(); };
+  $("chips").appendChild(b);
+});
+$("chatForm").onsubmit = async e => {
+  e.preventDefault();
+  const text = $("msg").value.trim(); if (!text) return;
+  $("msg").value = ""; add("me", text);
+  $("send").disabled = true;
+  const wait = add("bot", "…");
+  try { wait.textContent = (await post("/api/chat", { session_id: sid, message: text })).reply; }
+  catch (err) { wait.textContent = "Error: " + err.message; wait.classList.add("err"); }
+  $("send").disabled = false; $("msg").focus();
+};
+$("reset").onclick = async () => { await post("/api/chat/reset", { session_id: sid, message: "x" }); $("log").innerHTML = ""; add("bot", "Fresh start! What would you like to know?"); };
+
+// Coach
+$("u-date").value = new Date().toLocaleDateString("en-CA");
+$("u-date").max = $("u-date").value;
+$("usageForm").onsubmit = async e => {
+  e.preventDefault(); $("u-err").textContent = "";
+  const set = $("u-set").value;
+  try {
+    await post("/api/usage", { date: $("u-date").value, cost: +$("u-cost").value, setpoint: set ? +set : null });
+    $("u-cost").value = ""; loadCoach();
+  } catch (err) { $("u-err").textContent = err.message; }
+};
+function stat(label, val) { return `<div class="stat"><b>${val}</b><span>${label}</span></div>`; }
+async function loadCoach() {
+  try {
+    const s = await api("/api/coach/stats");
+    if (!s.enough_data) {
+      $("stats").textContent = `${s.entries} day(s) logged. ${s.message}`;
+    } else {
+      $("stats").innerHTML = `<div class="grid">` +
+        stat("Avg daily cost", "$" + s.avg_daily_cost.toFixed(2)) +
+        stat("Total logged", "$" + s.total_cost.toFixed(2)) +
+        stat("Avg setpoint", s.avg_setpoint_f != null ? s.avg_setpoint_f + "°F" : "–") +
+        stat("Savings per °F setback / mo", "≈ $" + s.est_monthly_savings_per_degree_setback.toFixed(2)) +
+        `</div><p class="note">${s.assumptions}</p>`;
+    }
+    const rows = await api("/api/usage");
+    const t = $("tbl"); t.innerHTML = "<tr><th>Date</th><th>Cost</th><th>Setpoint</th><th></th></tr>";
+    rows.slice().reverse().forEach(r => {
+      const tr = t.insertRow();
+      tr.insertCell().textContent = r.date;
+      tr.insertCell().textContent = "$" + r.cost.toFixed(2);
+      tr.insertCell().textContent = r.setpoint != null ? r.setpoint + "°F" : "–";
+      const b = document.createElement("button"); b.className = "link"; b.textContent = "delete";
+      b.onclick = async () => { await api("/api/usage/" + r.date, { method: "DELETE" }); loadCoach(); };
+      tr.insertCell().appendChild(b);
+    });
+  } catch (err) { $("stats").textContent = "Error: " + err.message; }
+}
+$("adviceBtn").onclick = async () => {
+  $("adviceBtn").disabled = true; $("advice").textContent = "Thinking…";
+  try { $("advice").textContent = (await api("/api/coach/advice")).advice; }
+  catch (err) { $("advice").textContent = "Error: " + err.message; }
+  $("adviceBtn").disabled = false;
+};
+</script>
+</body>
+</html>
